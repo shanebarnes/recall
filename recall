@@ -1,0 +1,9 @@
+#!/bin/bash
+
+if [[ -z "$@" ]]; then
+    printf "usage: ./recall [application]\n"
+    exit 1
+else
+    LD_PRELOAD=./librecall.so "$@"
+    exit 0
+fi
