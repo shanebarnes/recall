@@ -9,10 +9,18 @@
 #ifdef __cplusplus
     extern "C" {
 #endif
-        static void (*real_CRYPTO_free)(void*, const char*, int) = NULL;
-        static void* (*real_crypto_malloc)(size_t, const char*, int) = NULL;
+        //static void  (*real_OPENSSL_free)(void*) = NULL;
+        //static void* (*real_OPENSSL_malloc)(size_t) = NULL;
+        //static void* (*real_OPENSSL_realloc)(void*, size_t) = NULL;
+        //static void* (*real_OPENSSL_zalloc)(size_t) = NULL;
+
+        static void  (*real_CRYPTO_free)(void*, const char*, int) = NULL;
+        static void* (*real_CRYPTO_malloc)(size_t, const char*, int) = NULL;
+        static void* (*real_CRYPTO_realloc)(void*, size_t, const char*, int) = NULL;
+        static void* (*real_CRYPTO_zalloc)(size_t, const char*, int) = NULL;
+
         static void* (*real_calloc)(size_t, size_t) = NULL;
-        static void (*real_free)(void*) = NULL;
+        static void  (*real_free)(void*) = NULL;
         static void* (*real_malloc)(size_t) = NULL;
         static void* (*real_realloc)(void*, size_t) = NULL;
 #ifdef __cplusplus
@@ -23,49 +31,12 @@
     #include <array>
     #include <atomic>
     #include <chrono>
+    #include <cstdlib>
     #include <map>
     #include <mutex>
     #include <thread>
 
     namespace recall {
-        // Use custom map allocator since standard map allocator will use
-        // overriden new operator leading to infinite recursion
-        template<typename T>
-        struct map_alloc
-            : std::allocator<T> {
-            typedef typename std::allocator<T>::pointer pointer;
-            typedef typename std::allocator<T>::size_type size_type;
-
-            template<typename U>
-            struct rebind {
-                typedef map_alloc<U> other;
-            };
-
-            map_alloc() {}
-
-            template<typename U>
-            map_alloc(map_alloc<U> const& u)
-                : std::allocator<T>(u) {}
-
-            pointer allocate(size_type size, std::allocator<void>::const_pointer = 0) {
-                auto msize = size * sizeof(T);
-                void *ptr = NULL;
-                if (real_malloc != NULL) {
-                    ptr = real_malloc(msize == 0 ? 1 : msize);
-                } else {
-                    ptr = malloc(msize == 0 ? 1 : msize);
-                }
-                if(ptr == NULL) {
-                    throw std::bad_alloc();
-                }
-                return static_cast<pointer>(ptr);
-            }
-
-            void deallocate(pointer p, size_type size) {
-                    real_free(p);
-            }
-        };
-
         enum Op {
             ccalloc,
             cmalloc,
@@ -74,7 +45,11 @@
             cppnew,
             cppdelete,
             cryptomalloc,
+            cryptorealloc,
+            cryptozalloc,
             cryptofree,
+            internalnew,
+            internaldelete,
             max
         };
         const char* _opText[recall::max] = {
@@ -85,7 +60,11 @@
             "cpp.new",
             "cpp.delete",
             "crypto.malloc",
-            "crypto.free"
+            "crypto.realloc",
+            "crypto.zalloc",
+            "crypto.free",
+            "internal.new",
+            "internal.delete"
         };
 
         class MemMap {
@@ -95,39 +74,26 @@
                 if (_thread.joinable()) {
                     _thread.join();
                 }
-                std::lock_guard<std::mutex> lock(_mutex);
-                auto it = _map.begin();
-                while (it != _map.end()) {
-                    displayBacktrace(it->second.first, &it->second.second);
-                    releaseBacktrace(&it->second.second);
-                    _map.erase(it++);
-                }
-
-                //size_t limit = 10;
-                //size_t binSize = 1;
-                //size_t binCount = 0;
-                //fprintf(STATS_FILE, "\n");
-                //for (auto it = _hist.begin(); it != _hist.end(); it++) {
-                //    if (_hist.size() > limit) {
-                //        if (it->first > binSize) {
-                //            fprintf(STATS_FILE, "size: <= %lu, freq: %lu\n", binSize, binCount);
-                //            binSize *= 10;
-                //            binCount = it->second;
-                //        } else {
-                //            binCount += it->second;
-                //        }
-                //    } else {
-                //        fprintf(STATS_FILE, "size: %lu, freq: %lu\n", it->first, it->second);
-                //    }
-                //}
-                //if (binCount && _hist.size() > limit) {
-                //    fprintf(STATS_FILE, "size: <= %lu, freq: %lu\n", binSize, binCount);
-                //}
                 printStats();
             }
 
+            void internalAllocate(size_t size) {
+                _stats[recall::internalnew].ops++;
+                _stats[recall::internalnew].sum += size;
+            }
+
+            void internalDeallocate(size_t size) {
+                _stats[recall::internaldelete].ops++;
+                _stats[recall::internaldelete].sum += size;
+            }
+
             void allocate(void *ptr, size_t size, recall::Op op) {
-                if (ptr != NULL && !ignoreOp(op)) {
+                if (ptr == NULL) {
+                    // Do nothing
+                } else if (ignoreOp(op)) {
+                    //_stats[op].ops++;
+                    //_stats[op].sum += size;
+                } else {
                     std::lock_guard<std::mutex> lock(_mutex);
                     _stats[op].ops++;
                     auto it = _hist.find(size);
@@ -139,33 +105,44 @@
                     if (ptr != nullptr) {
                         auto it = _map.find(ptr);
                         if (it != _map.end()) {
-                            // TODO: update free total?
-                            _stats[op].sum -= size;
+                            _stats[it->second.op].sum -= size;
+                             //fprintf(stderr, "%s: moving %ld bytes from %s to %s\n", __FUNCTION__, size, _opText[it->second.op], _opText[op]);
+                            if (it->second.op != op) {
+                                it->second.op = op;
+                            }
+                            _stats[op].sum += size;
                         } else {
-                            _map[ptr].first = size;
+                            _map[ptr].op = op;
+                            auto it = _map.find(ptr);
+                            it->second.size = size;
+                            if (size >= _btMinSize) {
+                                captureBacktrace(&it->second.bt);
+                            }
+
+                            _stats[op].sum += size;
+                            _stats[op].max = std::max(_stats[op].max, static_cast<int64_t>(size));
+                            if (_stats[op].min > static_cast<int64_t>(size) || _stats[op].min == 0) {
+                               _stats[op].min = static_cast<int64_t>(size);
+                            }
+                            _stats[op].avg = _stats[op].ops > 0 ? _stats[op].sum / _stats[op].ops : 0;
+                            _totalCalls++;
                         }
-                        if (size >= _minBtSize) {
-                            captureBacktrace(op, &_map[ptr].second);
-                        }
-                        _stats[op].sum += size;
-                        _stats[op].max = std::max(_stats[op].max, static_cast<int64_t>(size));
-                        if (_stats[op].min > static_cast<int64_t>(size) || _stats[op].min == 0) {
-                           _stats[op].min = static_cast<int64_t>(size);
-                        }
-                        _stats[op].avg = _stats[op].ops > 0 ? _stats[op].sum / _stats[op].ops : 0;
-                        _totalCalls++;
                     }
                 }
             }
 
             void deallocate(void *ptr, recall::Op op) {
                 size_t size(0);
-                if (ptr != NULL && !ignoreOp(op)) {
+                if (ptr == NULL) {
+                    // Do nothing
+                } else if (ignoreOp(op)) {
+                    //_stats[op].ops++;
+                } else {
                     std::lock_guard<std::mutex> lock(_mutex);
                     auto it = _map.find(ptr);
                     if (it != _map.end()) {
-                        size = it->second.first;
-                        releaseBacktrace(&it->second.second);
+                        size = it->second.size;
+                        releaseBacktrace(&it->second.bt);
                         auto it2 = _hist.find(size);
                         if (it2 != _hist.end()) {
                             if (it2->second == 1) {
@@ -209,17 +186,39 @@
             }
 
         private:
+            const int DEF_ST_DISPLAY_INTERVAL_SEC = 1;
+            const int DEF_BT_DISPLAY_INTERVAL_SEC = 30;
+            const int DEF_BT_CAPTURE_MINIMUM_SIZE = 8192;
+
+            const char *ENV_BT_CAPTURE_MINIMUM_SIZE = "RECALL_BT_CAPTURE_MINSIZE";
+            const char *ENV_BT_DISPLAY_INTERVAL_SEC = "RECALL_BT_DISPLAY_INTERVAL";
+
             MemMap()
                 : _run(false)
                 , _totalCalls(0)
-                , _minBtSize(8192) {
+                , _statsFile(stdout)
+                , _btMinSize(DEF_BT_CAPTURE_MINIMUM_SIZE)
+                , _btDisplayIntSec(DEF_BT_DISPLAY_INTERVAL_SEC) {
                 ignoreOps(false);
             }
-
 
             void statsWorker() {
                 int64_t totalCalls(0);
                 int64_t idleTicks(0);
+                FILE *fp = fopen("recall.log", "w+");
+                if (fp != NULL) {
+                    _statsFile = fp;
+                }
+
+                if (const char *btMinSize = std::getenv(ENV_BT_CAPTURE_MINIMUM_SIZE)) {
+                    try { _btMinSize = std::stoul(btMinSize); } catch (...) {}
+                }
+                if (const char *btDisplayIntSec = std::getenv(ENV_BT_DISPLAY_INTERVAL_SEC)) {
+                    try { _btDisplayIntSec = std::stoi(btDisplayIntSec); } catch (...) {}
+                }
+                fprintf(_statsFile, "%s = %lu\n", ENV_BT_CAPTURE_MINIMUM_SIZE, _btMinSize);
+                fprintf(_statsFile, "%s = %d\n", ENV_BT_DISPLAY_INTERVAL_SEC, _btDisplayIntSec);
+
                 while (_run.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     std::lock_guard<std::mutex> lock(_mutex);
@@ -231,12 +230,45 @@
                         idleTicks++;
                     }
 
-                    if (idleTicks == 30) {
+                    if (idleTicks == _btDisplayIntSec) {
                         for (auto it = _map.begin(); it != _map.end(); it++) {
-                            displayBacktrace(it->second.first, &it->second.second);
+                            displayBacktrace(it->second.op, it->second.size, &it->second.bt);
                         }
                         printStats();
                     }
+                }
+
+                std::lock_guard<std::mutex> lock(_mutex);
+                auto it = _map.begin();
+                while (it != _map.end()) {
+                    displayBacktrace(it->second.op, it->second.size, &it->second.bt);
+                    releaseBacktrace(&it->second.bt);
+                    _map.erase(it++);
+                }
+
+                //size_t limit = 10;
+                //size_t binSize = 1;
+                //size_t binCount = 0;
+                //fprintf(_statsFile, "\n");
+                //for (auto it = _hist.begin(); it != _hist.end(); it++) {
+                //    if (_hist.size() > limit) {
+                //        if (it->first > binSize) {
+                //            fprintf(_statsFile, "size: <= %lu, freq: %lu\n", binSize, binCount);
+                //            binSize *= 10;
+                //            binCount = it->second;
+                //        } else {
+                //            binCount += it->second;
+                //        }
+                //    } else {
+                //        fprintf(_statsFile, "size: %lu, freq: %lu\n", it->first, it->second);
+                //    }
+                //}
+                //if (binCount && _hist.size() > limit) {
+                //    fprintf(_statsFile, "size: <= %lu, freq: %lu\n", binSize, binCount);
+                //}
+                if (_statsFile != stdout) {
+                    fclose(_statsFile);
+                    _statsFile = NULL;
                 }
             }
 
@@ -246,12 +278,14 @@
                 _ignoreOp[recall::crealloc].store(ignore);
                 _ignoreOp[recall::cppnew].store(ignore);
                 _ignoreOp[recall::cryptomalloc].store(ignore);
+                _ignoreOp[recall::cryptorealloc].store(ignore);
+                _ignoreOp[recall::cryptozalloc].store(ignore);
             }
 
             void ignoreFreeOps(bool ignore) {
                 _ignoreOp[recall::cfree].store(ignore);
                 _ignoreOp[recall::cryptofree].store(ignore);
-                _ignoreOp[recall::cryptomalloc].store(ignore);
+                _ignoreOp[recall::cryptofree].store(ignore);
                 _ignoreOp[recall::cppdelete].store(ignore);
                 _ignoreOp[recall::cryptofree].store(ignore);
             }
@@ -266,19 +300,86 @@
                 void  *buf[128];
                 int    frames;
                 char **strs;
+                int    strSize;
+            };
+        // Use custom map allocator since standard map allocator will use
+        // overriden new operator leading to infinite recursion
+        template<typename T>
+        struct map_alloc
+            : std::allocator<T> {
+            typedef typename std::allocator<T>::pointer pointer;
+            typedef typename std::allocator<T>::size_type size_type;
+
+            template<typename U>
+            struct rebind {
+                typedef map_alloc<U> other;
+            };
+
+            map_alloc() {}
+
+            template<typename U>
+            map_alloc(map_alloc<U> const& u)
+                : std::allocator<T>(u) {}
+
+            pointer allocate(size_type size, std::allocator<void>::const_pointer = 0) {
+                auto msize = size * sizeof(T);
+                void *ptr = NULL;
+                if (real_malloc != NULL) {
+                    ptr = real_malloc(msize == 0 ? 1 : msize);
+                } else {
+                    ptr = malloc(msize == 0 ? 1 : msize);
+                }
+                if(ptr == NULL) {
+                    throw std::bad_alloc();
+                }
+                recall::MemMap::getInstance().internalAllocate(size);
+                return static_cast<pointer>(ptr);
+            }
+
+            void deallocate(pointer p, size_type size) {
+                    if (p != nullptr) {
+                        recall::MemMap::getInstance().internalDeallocate(size);
+                    }
+                    real_free(p);
+            }
+        };
+
+            struct mem {
+                recall::Op  op;
+                std::size_t size;
+                Backtrace   bt;
             };
 
             // from /usr/include/c++/4.8.2/bits/stl_map.h
-            using map_type = std::map< void*, std::pair< std::size_t, Backtrace >, std::less<void*>, map_alloc< std::pair<void* const, std::size_t> > >;
+            //using map_type = std::map< void*, std::pair< std::size_t, Backtrace >, std::less<void*>, map_alloc< std::pair<void* const, std::size_t> > >;
+            using map_type = std::map<void*, struct mem, std::less<void*>, map_alloc<std::pair<void*, struct mem>>>;
             using hist_type = std::map< size_t, size_t, std::less<size_t>, map_alloc< std::pair<std::size_t, std::size_t> > >;
 
             map_type   _map;
             hist_type  _hist;
             std::mutex _mutex;
 
+            // std::map<recall::Op, std::pair<const char*, int>>
+            using op_type = std::map <recall::Op, std::pair<const char*, int>, std::less<recall::Op>, map_alloc<std::pair<const char*, int>>>;
+            /*const op_type _opMap = {
+                {recall::ccalloc,        {"c.calloc",         1}},
+                {recall::cmalloc,        {"c.malloc",         1}},
+                {recall::crealloc,       {"c.realloc",        1}},
+                {recall::cfree,          {"c.free",          -1}},
+                {recall::cppnew,         {"cpp.new",          1}},
+                {recall::cppdelete,      {"cpp.delete",      -1}},
+                {recall::cryptomalloc,   {"crypto.malloc",    1}},
+                {recall::cryptorealloc,  {"crypto.realloc",   1}},
+                {recall::cryptozalloc,   {"crypto.zalloc",    1}},
+                {recall::cryptofree,     {"crypto.free",     -1}},
+                {recall::internalnew,    {"internal.new",     1}},
+                {recall::internaldelete, {"internal.delete", -1}}
+            };*/
+
             std::thread _thread;
             std::atomic<bool> _run;
             int64_t _totalCalls;
+            FILE *_statsFile;
             struct Stats {
                 int64_t avg; // average bytes passed to/returned by operation
                 int64_t max; // maximum bytes passed to/returned by operation
@@ -288,22 +389,33 @@
             };
             std::array<Stats, recall::Op::max> _stats;
             std::array<std::atomic<bool>, recall::Op::max> _ignoreOp;
-            const size_t _minBtSize;
+            size_t _btMinSize;
+            int    _btDisplayIntSec;
 
-            void captureBacktrace(recall::Op op, Backtrace *bt) {
+            void captureBacktrace(Backtrace *bt) {
                 ignoreOps(true);
                 bt->frames = backtrace(bt->buf, sizeof(bt->buf) / sizeof(bt->buf[0]));
                 ignoreOps(false);
             }
 
-            void displayBacktrace(size_t size, Backtrace *bt) {
+            void displayBacktrace(recall::Op op, size_t size, Backtrace *bt) {
                 if (bt->frames > 0) {
-                    fprintf(STATS_FILE, "\n\n\nrecall: possible leak of %lu bytes\n", size);
-                    ignoreOps(true);
-                    bt->strs = backtrace_symbols(bt->buf, bt->frames);
-                    ignoreOps(false);
+                    fprintf(_statsFile, "\n\n\nrecall: %s possible leak of %lu bytes\n", _opText[op], size);
+                    // TODO: hash strings so that not printed repeatedly
+                    if (bt->strs == NULL) {
+                        ignoreOps(true);
+                        bt->strs = backtrace_symbols(bt->buf, bt->frames);
+                        if (bt->strs != NULL) {
+                            for (int i = 0; i < bt->frames; i++) {
+                                bt->strSize += strlen(bt->strs[i]) + 1;
+                            }
+                            _stats[recall::internalnew].ops++;
+                            _stats[recall::internalnew].sum += bt->strSize;
+                        }
+                        ignoreOps(false);
+                    }
                     for (int i = 0; i < bt->frames; i++) {
-                        fprintf(STATS_FILE, "    %2d: %s\n", i, bt->strs[i]);
+                        fprintf(_statsFile, "    %2d: %s\n", i, bt->strs[i]);
 
                         ////find first occurence of '(' or ' ' in message[i] and assume
                         ////everything before that is the file name. (Don't go beyond 0 though
@@ -326,41 +438,85 @@
             }
 
             void releaseBacktrace(Backtrace *bt) {
-                real_free(bt->strs);
-                bt->frames = 0;
-                bt->strs = NULL;
+                if (bt->strs != NULL) {
+                   _stats[recall::internaldelete].ops++;
+                   _stats[recall::internaldelete].sum += bt->strSize;
+                   real_free(bt->strs);
+                   bt->strs = NULL;
+                   bt->frames = 0;
+                }
             }
 
             const char *STATS_HEADER = "\nfunction               total          use       max       min       avg     calls\n";
             const char *STATS_RECORD = "%-15s %12" PRId64 " %12" PRId64 " %9" PRId64 " %9" PRId64 " %9" PRId64 " %9" PRId64 "\n";
-                  FILE *STATS_FILE = stdout;
+                  //FILE *_statsFile = stdout;
 
             void printStatsHeader() {
-                fprintf(STATS_FILE, STATS_HEADER);
+                fprintf(_statsFile, STATS_HEADER);
             }
 
             void printStatsRecord(recall::Op op) {
                 int64_t use(0);
                 switch (op) {
                 case recall::cmalloc:
-                    use = _stats[op].sum - _stats[recall::cfree].sum;
+                    use = _stats[op].sum + _stats[recall::ccalloc].sum + _stats[recall::crealloc].sum - _stats[recall::cfree].sum;
                     break;
                 case recall::cppnew:
                     use = _stats[op].sum - _stats[recall::cppdelete].sum;
                     break;
                 case recall::cryptomalloc:
-                    use = _stats[op].sum - _stats[recall::cryptofree].sum;
+                    use = _stats[op].sum + _stats[recall::cryptorealloc].sum + _stats[recall::cryptozalloc].sum - _stats[recall::cryptofree].sum;
+                    break;
+                case recall::internalnew:
+                    use = _stats[op].sum - _stats[recall::internaldelete].sum;
                     break;
                 default:
                     break;
                 }
-                fprintf(STATS_FILE, STATS_RECORD, _opText[op], _stats[op].sum, use, _stats[op].max, _stats[op].min, _stats[op].avg, _stats[op].ops);
+                fprintf(_statsFile, STATS_RECORD, _opText[op], _stats[op].sum, use, _stats[op].max, _stats[op].min, _stats[op].avg, _stats[op].ops);
             }
 
             void printStatsFooter() {
-                int64_t use(_stats[recall::ccalloc].sum + _stats[recall::cmalloc].sum + _stats[recall::crealloc].sum - _stats[recall::cfree].sum + _stats[recall::cryptomalloc].sum - _stats[recall::cryptofree].sum + _stats[recall::cppnew].sum - _stats[recall::cppdelete].sum);
-                int64_t ops(_stats[recall::ccalloc].ops + _stats[recall::cmalloc].ops + _stats[recall::crealloc].ops - _stats[recall::cfree].ops + _stats[recall::cryptomalloc].ops - _stats[recall::cryptofree].ops + _stats[recall::cppnew].ops - _stats[recall::cppdelete].ops);
-                fprintf(STATS_FILE, STATS_RECORD, "net total", use, use, 0LL, 0LL, 0LL, ops);
+                int64_t use(0), ops(0);
+                //for (auto it = _opMap.begin(); it != _opMap.end(); it++) {
+                //    switch(it->second.second) {
+                //    case 1:
+                //        ops += _stats[it->first].ops;
+                //        use += _stats[it->first].sum;
+                //        break;
+                //    case -1:
+                //        ops -= _stats[it->first].ops;
+                //        use -= _stats[it->first].sum;
+                //        break;
+                //    default:
+                //        break;
+                //    }
+                //}
+                use = _stats[recall::ccalloc].sum +
+                      _stats[recall::cmalloc].sum +
+                      _stats[recall::crealloc].sum -
+                      _stats[recall::cfree].sum +
+                      _stats[recall::cryptomalloc].sum +
+                      _stats[recall::cryptorealloc].sum +
+                      _stats[recall::cryptozalloc].sum -
+                      _stats[recall::cryptofree].sum +
+                      _stats[recall::cppnew].sum -
+                      _stats[recall::cppdelete].sum +
+                      _stats[recall::internalnew].sum -
+                      _stats[recall::internaldelete].sum;
+                ops = _stats[recall::ccalloc].ops +
+                      _stats[recall::cmalloc].ops +
+                      _stats[recall::crealloc].ops -
+                      _stats[recall::cfree].ops +
+                      _stats[recall::cryptomalloc].ops +
+                      _stats[recall::cryptorealloc].ops +
+                      _stats[recall::cryptozalloc].ops -
+                      _stats[recall::cryptofree].ops +
+                      _stats[recall::cppnew].ops -
+                      _stats[recall::cppdelete].ops +
+                      _stats[recall::internalnew].ops -
+                      _stats[recall::internaldelete].ops;
+                fprintf(_statsFile, STATS_RECORD, "net total", use, use, 0LL, 0LL, 0LL, ops);
             }
 
             void printStats() {
@@ -384,6 +540,19 @@
 
         static void __attribute__((constructor))init(void) {
             fprintf(stdout, "Recall init: started\n");
+            /*real_OPENSSL_free = (void (*)(void*))dlsym(RTLD_NEXT, "OPENSSL_free");
+            if ((error = dlerror()) != NULL) {
+                fprintf(stderr, "Recall init: %s\n", error);
+            } else {
+                fprintf(stdout, "Recall init: loaded OPENSSL_free, %p\n", real_OPENSSL_free);
+            }
+
+            real_OPENSSL_malloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "OPENSSL_malloc");
+            if ((error = dlerror()) != NULL) {
+                fprintf(stderr, "Recall init: %s\n", error);
+            } else {
+                fprintf(stdout, "Recall init: loaded OPENSSL_malloc, %p\n", real_OPENSSL_malloc);
+            }*/
 
             real_calloc = (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
             fprintf(stdout, "Recall init: loaded calloc, %p\n", real_calloc);
@@ -400,8 +569,14 @@
             real_CRYPTO_free = (void (*)(void*, const char*, int))dlsym(RTLD_NEXT, "CRYPTO_free");
             fprintf(stdout, "Recall init: loaded CRYPTO_free, %p\n", real_CRYPTO_free);
 
-            real_crypto_malloc = (void* (*)(size_t, const char*, int))dlsym(RTLD_NEXT, "CRYPTO_malloc");
-            fprintf(stdout, "Recall init: loaded CRYPTO_malloc, %p\n", real_crypto_malloc);
+            real_CRYPTO_malloc = (void* (*)(size_t, const char*, int))dlsym(RTLD_NEXT, "CRYPTO_malloc");
+            fprintf(stdout, "Recall init: loaded CRYPTO_malloc, %p\n", real_CRYPTO_malloc);
+
+            real_CRYPTO_realloc = (void* (*)(void*, size_t, const char*, int))dlsym(RTLD_NEXT, "CRYPTO_realloc");
+            fprintf(stdout, "Recall init: loaded CRYPTO_realloc, %p\n", real_CRYPTO_realloc);
+
+            real_CRYPTO_zalloc = (void* (*)(size_t, const char*, int))dlsym(RTLD_NEXT, "CRYPTO_zalloc");
+            fprintf(stdout, "Recall init: loaded CRYPTO_zalloc, %p\n", real_CRYPTO_realloc);
 
             recall::MemMap::getInstance().startThread();
             fprintf(stdout, "Recall init: finished\n");
@@ -409,18 +584,6 @@
 
         static void __attribute__ ((destructor)) my_fini(void) {
             fprintf(stdout, "Recall fini: done\n");
-        }
-
-        void CRYPTO_free(void *ptr, const char *file, int line) {
-            recall::MemMap::getInstance().deallocate(ptr, recall::cryptofree);
-            real_CRYPTO_free(ptr, file, line);
-        }
-
-        void* CRYPTO_malloc(size_t size, const char *file, int line) {
-            void *ptr = NULL;
-            ptr = real_crypto_malloc(size, file, line);
-            recall::MemMap::getInstance().allocate(ptr, size, recall::cryptomalloc);
-            return ptr;
         }
 
         int init_free(void *ptr) {
@@ -446,6 +609,67 @@
             return rptr;
         }
 
+        void CRYPTO_free(void *ptr, const char *file, int line) {
+            if (real_CRYPTO_free == NULL || init_free(ptr) == 0) {
+                return;
+            }
+            recall::MemMap::getInstance().deallocate(ptr, recall::cryptofree);
+            real_CRYPTO_free(ptr, file, line);
+        }
+
+        void* CRYPTO_malloc(size_t size, const char *file, int line) {
+            void *ptr = NULL;
+            if (real_CRYPTO_malloc == NULL) {
+                return init_malloc(size);
+            }
+            ptr = real_CRYPTO_malloc(size, file, line);
+            recall::MemMap::getInstance().allocate(ptr, size, recall::cryptomalloc);
+            return ptr;
+        }
+
+        void* CRYPTO_realloc(void *ptr, size_t num, const char *file, int line) {
+            void *rptr = NULL;
+            if (ptr == NULL) {
+                return CRYPTO_malloc(num, file, line);
+            } else if (real_CRYPTO_realloc == NULL || init_free(ptr) == 0) {
+                return init_realloc(ptr, num);
+            }
+            recall::MemMap::getInstance().deallocate(ptr, recall::cryptofree);
+            rptr = real_CRYPTO_realloc(ptr, num, file, line);
+            recall::MemMap::getInstance().allocate(rptr, num, recall::cryptorealloc);
+            return rptr;
+        }
+
+        void* CRYPTO_zalloc(size_t num, const char *file, int line) {
+            void *ptr = NULL;
+            if (real_CRYPTO_zalloc == NULL) {
+                ptr = CRYPTO_malloc(num, file, line);
+                bzero(ptr, num);
+                return ptr;
+            }
+            ptr = real_CRYPTO_zalloc(num, file, line);
+            recall::MemMap::getInstance().allocate(ptr, num, recall::cryptozalloc);
+            return ptr;
+        }
+
+        //void OPENSSL_free(void *ptr) {
+        //    if (real_OPENSSL_free == NULL || init_free(ptr) == 0) {
+        //        return;
+        //    }
+        //    recall::MemMap::getInstance().deallocate(ptr, recall::cryptofree);
+        //    real_OPENSSL_free(ptr);
+        //}
+
+        //void* OPENSSL_malloc(size_t size) {
+        //    void *ptr = NULL;
+        //    if (real_OPENSSL_malloc == NULL) {
+        //        return init_malloc(size);
+        //    }
+        //    ptr = real_OPENSSL_malloc(size);
+        //    recall::MemMap::getInstance().allocate(ptr, size, recall::cryptomalloc);
+        //    return ptr;
+        //}
+
         void* calloc(size_t nmemb, size_t size) {
             void *ptr = NULL;
             if (real_calloc == NULL) {
@@ -453,7 +677,6 @@
                 bzero(ptr, nmemb * size);
                 return ptr;
             }
-
             ptr = real_calloc(nmemb, size);
             recall::MemMap::getInstance().allocate(ptr, nmemb * size, recall::ccalloc);
             return ptr;
