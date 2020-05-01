@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <inttypes.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,11 +10,6 @@
 #ifdef __cplusplus
     extern "C" {
 #endif
-        //static void  (*real_OPENSSL_free)(void*) = NULL;
-        //static void* (*real_OPENSSL_malloc)(size_t) = NULL;
-        //static void* (*real_OPENSSL_realloc)(void*, size_t) = NULL;
-        //static void* (*real_OPENSSL_zalloc)(size_t) = NULL;
-
         static void  (*real_CRYPTO_free)(void*, const char*, int) = NULL;
         static void* (*real_CRYPTO_malloc)(size_t, const char*, int) = NULL;
         static void* (*real_CRYPTO_realloc)(void*, size_t, const char*, int) = NULL;
@@ -74,7 +70,6 @@
                 if (_thread.joinable()) {
                     _thread.join();
                 }
-                printStats();
             }
 
             void internalAllocate(size_t size) {
@@ -88,29 +83,27 @@
             }
 
             void allocate(void *ptr, size_t size, recall::Op op) {
+                auto tid(getThreadId());
                 if (ptr == NULL) {
                     // Do nothing
-                } else if (ignoreOp(op)) {
+                } else if (ignoreOp(tid, op)) {
+                    //fprintf(stdout, "%s: ignoring %p from %s of size %lu\n", __FUNCTION__, ptr, _opText[op], size);
                     //_stats[op].ops++;
                     //_stats[op].sum += size;
                 } else {
                     std::lock_guard<std::mutex> lock(_mutex);
-                    _stats[op].ops++;
-                    auto it = _hist.find(size);
-                    if (it != _hist.end()) {
-                        _hist[size]++;
-                    } else {
-                        _hist[size] = 1;
-                    }
+                    updateThreads(tid, op);
                     if (ptr != nullptr) {
                         auto it = _map.find(ptr);
                         if (it != _map.end()) {
                             _stats[it->second.op].sum -= size;
+                            _stats[it->second.op].ops--;
                              //fprintf(stderr, "%s: moving %ld bytes from %s to %s\n", __FUNCTION__, size, _opText[it->second.op], _opText[op]);
                             if (it->second.op != op) {
                                 it->second.op = op;
                             }
                             _stats[op].sum += size;
+                            _stats[op].ops++;
                         } else {
                             _map[ptr].op = op;
                             auto it = _map.find(ptr);
@@ -125,20 +118,41 @@
                                _stats[op].min = static_cast<int64_t>(size);
                             }
                             _stats[op].avg = _stats[op].ops > 0 ? _stats[op].sum / _stats[op].ops : 0;
+                            _stats[op].ops++;
+                            auto hit = _hist.find(size);
+                            if (hit != _hist.end()) {
+                               hit->second++;
+                            } else {
+                                _hist[size] = 1;
+                            }
                             _totalCalls++;
                         }
                     }
                 }
             }
 
-            void deallocate(void *ptr, recall::Op op) {
+            void updateThreads(size_t tid, recall::Op op) {
+                _threads[tid]++;
+            }
+
+            size_t deallocate(void *ptr, recall::Op op) {
+                auto tid(getThreadId());
                 size_t size(0);
                 if (ptr == NULL) {
                     // Do nothing
-                } else if (ignoreOp(op)) {
+                } else if (ignoreOp(tid, op)) {
+                    //fprintf(stdout, "%s: ignoring %p from %s\n", __FUNCTION__, ptr, _opText[op]);
+                    /*std::lock_guard<std::mutex> lock(_mutex);
+                    auto it = _map.find(ptr);
+                    if (it != _map.end()) {
+                        _stats[op].ops++;
+                        _stats[op].sum += it->second.size;
+                        _map.erase(it);
+                    }*/
                     //_stats[op].ops++;
                 } else {
                     std::lock_guard<std::mutex> lock(_mutex);
+                    updateThreads(tid, op);
                     auto it = _map.find(ptr);
                     if (it != _map.end()) {
                         size = it->second.size;
@@ -160,8 +174,12 @@
                         }
                         _stats[op].avg = _stats[op].ops > 0 ? _stats[op].sum / _stats[op].ops : 0;
                         _totalCalls++;
+                    } else {
+                        //fprintf(stdout, "%s: ignoring 2 %p from %s\n", __FUNCTION__, ptr, _opText[op]);
                     }
                 }
+
+                return size;
             }
 
             static MemMap& getInstance() {
@@ -174,14 +192,22 @@
             MemMap& operator=(MemMap const&) = delete;
             MemMap& operator=(MemMap&&) = delete;
 
-            bool ignoreOp(recall::Op op) {
-                return _ignoreOp[op].load();
+            static size_t getThreadId() {
+                return std::hash<std::thread::id>()(std::this_thread::get_id());
+            }
+
+            bool ignoreOp(size_t tid, recall::Op op) {
+                return _threadId == 0 || tid == _threadId || _ignoreOp[op].load();
             }
 
             void startThread() {
                 if (!_run.load()) {
                     _run.store(true);
-                    _thread = std::thread(&MemMap::statsWorker, this);
+                    try {
+                        _thread = std::thread(&MemMap::statsWorker, this);
+                    } catch (std::exception &e) {
+                        fprintf(stderr, "Recall init: %s\n", e.what());
+                    }
                 }
             }
 
@@ -194,12 +220,12 @@
             const char *ENV_BT_DISPLAY_INTERVAL_SEC = "RECALL_BT_DISPLAY_INTERVAL";
 
             MemMap()
-                : _run(false)
+                : _threadId(0)
+                , _run(false)
                 , _totalCalls(0)
                 , _statsFile(stdout)
                 , _btMinSize(DEF_BT_CAPTURE_MINIMUM_SIZE)
                 , _btDisplayIntSec(DEF_BT_DISPLAY_INTERVAL_SEC) {
-                ignoreOps(false);
             }
 
             void statsWorker() {
@@ -219,6 +245,8 @@
                 fprintf(_statsFile, "%s = %lu\n", ENV_BT_CAPTURE_MINIMUM_SIZE, _btMinSize);
                 fprintf(_statsFile, "%s = %d\n", ENV_BT_DISPLAY_INTERVAL_SEC, _btDisplayIntSec);
 
+                _threadId.store(getThreadId());
+
                 while (_run.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     std::lock_guard<std::mutex> lock(_mutex);
@@ -231,10 +259,18 @@
                     }
 
                     if (idleTicks == _btDisplayIntSec) {
+                        int count = 0;
                         for (auto it = _map.begin(); it != _map.end(); it++) {
                             displayBacktrace(it->second.op, it->second.size, &it->second.bt);
+                            if (++count > 100) {
+                                break;
+                            }
                         }
-                        printStats();
+
+                        if (count) {
+                            printStats();
+                        }
+                        idleTicks = 0;
                     }
                 }
 
@@ -246,29 +282,10 @@
                     _map.erase(it++);
                 }
 
-                //size_t limit = 10;
-                //size_t binSize = 1;
-                //size_t binCount = 0;
-                //fprintf(_statsFile, "\n");
-                //for (auto it = _hist.begin(); it != _hist.end(); it++) {
-                //    if (_hist.size() > limit) {
-                //        if (it->first > binSize) {
-                //            fprintf(_statsFile, "size: <= %lu, freq: %lu\n", binSize, binCount);
-                //            binSize *= 10;
-                //            binCount = it->second;
-                //        } else {
-                //            binCount += it->second;
-                //        }
-                //    } else {
-                //        fprintf(_statsFile, "size: %lu, freq: %lu\n", it->first, it->second);
-                //    }
-                //}
-                //if (binCount && _hist.size() > limit) {
-                //    fprintf(_statsFile, "size: <= %lu, freq: %lu\n", binSize, binCount);
-                //}
+                printStats();
                 if (_statsFile != stdout) {
                     fclose(_statsFile);
-                    _statsFile = NULL;
+                    _statsFile = stdout;
                 }
             }
 
@@ -302,47 +319,49 @@
                 char **strs;
                 int    strSize;
             };
-        // Use custom map allocator since standard map allocator will use
-        // overriden new operator leading to infinite recursion
-        template<typename T>
-        struct map_alloc
-            : std::allocator<T> {
-            typedef typename std::allocator<T>::pointer pointer;
-            typedef typename std::allocator<T>::size_type size_type;
 
-            template<typename U>
-            struct rebind {
-                typedef map_alloc<U> other;
-            };
-
-            map_alloc() {}
-
-            template<typename U>
-            map_alloc(map_alloc<U> const& u)
-                : std::allocator<T>(u) {}
-
-            pointer allocate(size_type size, std::allocator<void>::const_pointer = 0) {
-                auto msize = size * sizeof(T);
-                void *ptr = NULL;
-                if (real_malloc != NULL) {
-                    ptr = real_malloc(msize == 0 ? 1 : msize);
-                } else {
-                    ptr = malloc(msize == 0 ? 1 : msize);
-                }
-                if(ptr == NULL) {
-                    throw std::bad_alloc();
-                }
-                recall::MemMap::getInstance().internalAllocate(size);
-                return static_cast<pointer>(ptr);
-            }
-
-            void deallocate(pointer p, size_type size) {
-                    if (p != nullptr) {
-                        recall::MemMap::getInstance().internalDeallocate(size);
+            // Use custom map allocator since standard map allocator will use
+            // overriden new operator leading to infinite recursion
+            template<typename T>
+            struct map_alloc
+                : std::allocator<T> {
+                typedef typename std::allocator<T>::pointer pointer;
+                typedef typename std::allocator<T>::size_type size_type;
+    
+                template<typename U>
+                struct rebind {
+                    typedef map_alloc<U> other;
+                };
+    
+                map_alloc() {}
+    
+                template<typename U>
+                map_alloc(map_alloc<U> const& u)
+                    : std::allocator<T>(u) {}
+    
+                pointer allocate(size_type size, std::allocator<void>::const_pointer = 0) {
+                    auto msize = size * sizeof(T);
+                    void *ptr = NULL;
+                    if (real_malloc != NULL) {
+                        ptr = real_malloc(msize == 0 ? 1 : msize);
+                    } else {
+                        // init_malloc?
+                        ptr = malloc(msize == 0 ? 1 : msize);
                     }
-                    real_free(p);
-            }
-        };
+                    if(ptr == NULL) {
+                        throw std::bad_alloc();
+                    }
+                    recall::MemMap::getInstance().internalAllocate(size);
+                    return static_cast<pointer>(ptr);
+                }
+    
+                void deallocate(pointer p, size_type size) {
+                        if (p != nullptr) {
+                            recall::MemMap::getInstance().internalDeallocate(size);
+                        }
+                        real_free(p);
+                }
+            };
 
             struct mem {
                 recall::Op  op;
@@ -357,24 +376,26 @@
 
             map_type   _map;
             hist_type  _hist;
+            hist_type  _threads;
+            std::atomic<size_t> _threadId;
             std::mutex _mutex;
 
             // std::map<recall::Op, std::pair<const char*, int>>
-            using op_type = std::map <recall::Op, std::pair<const char*, int>, std::less<recall::Op>, map_alloc<std::pair<const char*, int>>>;
-            /*const op_type _opMap = {
-                {recall::ccalloc,        {"c.calloc",         1}},
-                {recall::cmalloc,        {"c.malloc",         1}},
-                {recall::crealloc,       {"c.realloc",        1}},
-                {recall::cfree,          {"c.free",          -1}},
-                {recall::cppnew,         {"cpp.new",          1}},
-                {recall::cppdelete,      {"cpp.delete",      -1}},
-                {recall::cryptomalloc,   {"crypto.malloc",    1}},
-                {recall::cryptorealloc,  {"crypto.realloc",   1}},
-                {recall::cryptozalloc,   {"crypto.zalloc",    1}},
-                {recall::cryptofree,     {"crypto.free",     -1}},
-                {recall::internalnew,    {"internal.new",     1}},
-                {recall::internaldelete, {"internal.delete", -1}}
-            };*/
+            //using op_type = std::map <recall::Op, std::pair<const char*, int>, std::less<recall::Op>, map_alloc<std::pair<const char*, int>>>;
+            //const op_type _opMap = {
+            //    {recall::ccalloc,        {"c.calloc",         1}},
+            //    {recall::cmalloc,        {"c.malloc",         1}},
+            //    {recall::crealloc,       {"c.realloc",        1}},
+            //    {recall::cfree,          {"c.free",          -1}},
+            //    {recall::cppnew,         {"cpp.new",          1}},
+            //    {recall::cppdelete,      {"cpp.delete",      -1}},
+            //    {recall::cryptomalloc,   {"crypto.malloc",    1}},
+            //    {recall::cryptorealloc,  {"crypto.realloc",   1}},
+            //    {recall::cryptozalloc,   {"crypto.zalloc",    1}},
+            //    {recall::cryptofree,     {"crypto.free",     -1}},
+            //    {recall::internalnew,    {"internal.new",     1}},
+            //    {recall::internaldelete, {"internal.delete", -1}}
+            //};
 
             std::thread _thread;
             std::atomic<bool> _run;
@@ -403,7 +424,6 @@
                     fprintf(_statsFile, "\n\n\nrecall: %s possible leak of %lu bytes\n", _opText[op], size);
                     // TODO: hash strings so that not printed repeatedly
                     if (bt->strs == NULL) {
-                        ignoreOps(true);
                         bt->strs = backtrace_symbols(bt->buf, bt->frames);
                         if (bt->strs != NULL) {
                             for (int i = 0; i < bt->frames; i++) {
@@ -412,7 +432,6 @@
                             _stats[recall::internalnew].ops++;
                             _stats[recall::internalnew].sum += bt->strSize;
                         }
-                        ignoreOps(false);
                     }
                     for (int i = 0; i < bt->frames; i++) {
                         fprintf(_statsFile, "    %2d: %s\n", i, bt->strs[i]);
@@ -434,6 +453,7 @@
                         ////_ignoreOp[recall::cmalloc].store(false);
                         //ignoreOps(false);
                     }
+                    fflush(_statsFile);
                 }
             }
 
@@ -520,11 +540,36 @@
             }
 
             void printStats() {
+                size_t limit = 10;
+                size_t binSize = 1;
+                size_t binCount = 0;
+                fprintf(_statsFile, "\nMemory Size Distribution:\n");
+                fprintf(_statsFile, "   %-12s %9s\n", "size", "frequency");
+                for (auto it = _hist.begin(); it != _hist.end(); it++) {
+                    if (_hist.size() > limit) {
+                        if (it->first > binSize) {
+                            fprintf(_statsFile, "<= %-12lu %-9lu\n", binSize, binCount);
+                            binSize *= 10;
+                            binCount = it->second;
+                        } else {
+                            binCount += it->second;
+                        }
+                    } else {
+                        fprintf(_statsFile, "<= %-12lu %-9lu\n", it->first, it->second);
+                    }
+                }
+                if (binCount && _hist.size() > limit) {
+                    fprintf(_statsFile, "<= %-12lu %-9lu\n", binSize, binCount);
+                }
+
+                fprintf(_statsFile, "\nTotal unique threads: %lu\n", _threads.size());
+
                 printStatsHeader();
                 for (auto i = 0; i < recall::max; i++) {
                     printStatsRecord(recall::Op(i));
                 }
                 printStatsFooter();
+                fflush(_statsFile);
             }
         };
     }
@@ -540,19 +585,6 @@
 
         static void __attribute__((constructor))init(void) {
             fprintf(stdout, "Recall init: started\n");
-            /*real_OPENSSL_free = (void (*)(void*))dlsym(RTLD_NEXT, "OPENSSL_free");
-            if ((error = dlerror()) != NULL) {
-                fprintf(stderr, "Recall init: %s\n", error);
-            } else {
-                fprintf(stdout, "Recall init: loaded OPENSSL_free, %p\n", real_OPENSSL_free);
-            }
-
-            real_OPENSSL_malloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "OPENSSL_malloc");
-            if ((error = dlerror()) != NULL) {
-                fprintf(stderr, "Recall init: %s\n", error);
-            } else {
-                fprintf(stdout, "Recall init: loaded OPENSSL_malloc, %p\n", real_OPENSSL_malloc);
-            }*/
 
             real_calloc = (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
             fprintf(stdout, "Recall init: loaded calloc, %p\n", real_calloc);
@@ -652,24 +684,6 @@
             return ptr;
         }
 
-        //void OPENSSL_free(void *ptr) {
-        //    if (real_OPENSSL_free == NULL || init_free(ptr) == 0) {
-        //        return;
-        //    }
-        //    recall::MemMap::getInstance().deallocate(ptr, recall::cryptofree);
-        //    real_OPENSSL_free(ptr);
-        //}
-
-        //void* OPENSSL_malloc(size_t size) {
-        //    void *ptr = NULL;
-        //    if (real_OPENSSL_malloc == NULL) {
-        //        return init_malloc(size);
-        //    }
-        //    ptr = real_OPENSSL_malloc(size);
-        //    recall::MemMap::getInstance().allocate(ptr, size, recall::cryptomalloc);
-        //    return ptr;
-        //}
-
         void* calloc(size_t nmemb, size_t size) {
             void *ptr = NULL;
             if (real_calloc == NULL) {
@@ -688,6 +702,11 @@
             }
             recall::MemMap::getInstance().deallocate(ptr, recall::cfree);
             real_free(ptr);
+            //if (size >= 4064) {
+            //    if (malloc_trim(0) == 1) {
+            //        fprintf(stdout, "Trimmed %lu bytes\n", size);
+            //    }
+            //}
         }
 
         void* malloc(size_t size) {
