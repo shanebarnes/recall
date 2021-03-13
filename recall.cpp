@@ -1,7 +1,9 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <inttypes.h>
-#include <malloc.h>
+#ifdef __linux__
+    #include <malloc.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -231,10 +233,10 @@
             void statsWorker() {
                 int64_t totalCalls(0);
                 int64_t idleTicks(0);
-                FILE *fp = fopen("recall.log", "w+");
-                if (fp != NULL) {
-                    _statsFile = fp;
-                }
+                //FILE *fp = fopen("recall.log", "w+");
+                //if (fp != NULL) {
+                //    _statsFile = fp;
+                //}
 
                 if (const char *btMinSize = std::getenv(ENV_BT_CAPTURE_MINIMUM_SIZE)) {
                     try { _btMinSize = std::stoul(btMinSize); } catch (...) {}
@@ -371,8 +373,8 @@
 
             // from /usr/include/c++/4.8.2/bits/stl_map.h
             //using map_type = std::map< void*, std::pair< std::size_t, Backtrace >, std::less<void*>, map_alloc< std::pair<void* const, std::size_t> > >;
-            using map_type = std::map<void*, struct mem, std::less<void*>, map_alloc<std::pair<void*, struct mem>>>;
-            using hist_type = std::map< size_t, size_t, std::less<size_t>, map_alloc< std::pair<std::size_t, std::size_t> > >;
+            using map_type = std::map<void*, struct mem, std::less<void*>, map_alloc<std::pair<void* const, struct mem>>>;
+            using hist_type = std::map<size_t, size_t, std::less<size_t>, map_alloc< std::pair<const std::size_t, std::size_t> > >;
 
             map_type   _map;
             hist_type  _hist;
@@ -469,10 +471,9 @@
 
             const char *STATS_HEADER = "\nfunction               total          use       max       min       avg     calls\n";
             const char *STATS_RECORD = "%-15s %12" PRId64 " %12" PRId64 " %9" PRId64 " %9" PRId64 " %9" PRId64 " %9" PRId64 "\n";
-                  //FILE *_statsFile = stdout;
 
             void printStatsHeader() {
-                fprintf(_statsFile, STATS_HEADER);
+                fprintf(_statsFile, "%s", STATS_HEADER);
             }
 
             void printStatsRecord(recall::Op op) {
