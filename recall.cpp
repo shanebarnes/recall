@@ -1,7 +1,9 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <inttypes.h>
-#ifdef __linux__
+#if defined(__APPLE__)
+    #include <malloc/malloc.h>
+#elif defined(__linux__)
     #include <malloc.h>
 #endif
 #include <stdio.h>
@@ -119,8 +121,8 @@
                             if (_stats[op].min > static_cast<int64_t>(size) || _stats[op].min == 0) {
                                _stats[op].min = static_cast<int64_t>(size);
                             }
-                            _stats[op].avg = _stats[op].ops > 0 ? _stats[op].sum / _stats[op].ops : 0;
                             _stats[op].ops++;
+                            _stats[op].avg = _stats[op].ops > 0 ? _stats[op].sum / _stats[op].ops : 0;
                             auto hit = _hist.find(size);
                             if (hit != _hist.end()) {
                                hit->second++;
@@ -214,7 +216,7 @@
             }
 
         private:
-            const int DEF_ST_DISPLAY_INTERVAL_SEC = 1;
+            //const int DEF_ST_DISPLAY_INTERVAL_SEC = 1;
             const int DEF_BT_DISPLAY_INTERVAL_SEC = 30;
             const int DEF_BT_CAPTURE_MINIMUM_SIZE = 8192;
 

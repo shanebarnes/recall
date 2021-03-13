@@ -34,7 +34,7 @@ c.calloc                   0            0         0         0         0         
 c.malloc                   0            0         0         0         0         0
 c.realloc                  0            0         0         0         0         0
 c.free                     0            0         0         0         0         0
-cpp.new               196608       131072    131072     65536    196608         2
+cpp.new               196608       131072    131072     65536     98304         2
 cpp.delete             65536            0     65536     65536     65536         1
 crypto.malloc              0            0         0         0         0         0
 crypto.realloc             0            0         0         0         0         0
