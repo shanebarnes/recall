@@ -1,15 +1,31 @@
 # recall
 Profile memory on Unix systems using the LD_PRELOAD trick
 
+## Build
+
+```
+$ ./scripts/build.sh
+```
+
 ## Examples
+
+### Linux
+
+```
+$ export RECALL_BT_DISPLAY_INTERVAL=1
+$ LD_PRELOAD=./build/librecall.so ./build/leak
+```
 
 ### macOS
 
 ```
-$ cmake -H. -Bbuild
-$ cd build/
-$ make
-$ export RECALL_BT_DISPLAY_INTERVAL=1; DYLD_INSERT_LIBRARIES=$PWD/librecall.0.0.1.dylib ./leak
+$ export RECALL_BT_DISPLAY_INTERVAL=1
+$ DYLD_INSERT_LIBRARIES=./build/librecall.dylib ./build/leak
+```
+
+### Periodic Output
+
+```
 Recall init: started
 Recall init: loaded calloc, 0x7fff2027f5bd
 Recall init: loaded malloc, 0x7fff2027d510

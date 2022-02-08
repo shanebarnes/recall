@@ -1,0 +1,34 @@
+name: recall
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os_version: [macos-latest, ubuntu-latest]
+        include:
+          - os_version: macos-latest
+            script_name: ./scripts/build.sh
+          - os_version: ubuntu-latest
+            script_name: ./scripts/build.sh
+    runs-on: ${{ matrix.os_version }}
+    steps:
+      - name: Install dependencies on macOS
+        if: startsWith(matrix.os_version, 'macos')
+        run: |
+          brew install cmake
+      - name: Install dependencies on Ubuntu
+        if: startsWith(matrix.os_version, 'ubuntu')
+        run: |
+          sudo apt update
+          sudo apt install cmake
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Build Artifacts
+        run: ${{ matrix.script_name }}
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@master
+        with:
+          name: recall
+          path: build
