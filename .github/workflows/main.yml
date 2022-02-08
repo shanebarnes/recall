@@ -14,15 +14,11 @@ jobs:
             script_name: ./scripts/build.sh
     runs-on: ${{ matrix.os_version }}
     steps:
-      - name: Install dependencies on macOS
-        if: startsWith(matrix.os_version, 'macos')
-        run: |
-          brew install cmake
       - name: Install dependencies on Ubuntu
         if: startsWith(matrix.os_version, 'ubuntu')
         run: |
-          sudo apt-get update
-          sudo apt-get install cmake
+          #sudo apt-get update
+          #sudo apt-get install cmake
       - name: Checkout code
         uses: actions/checkout@v2
       - name: Build Artifacts
