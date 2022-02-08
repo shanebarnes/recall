@@ -21,8 +21,8 @@ jobs:
       - name: Install dependencies on Ubuntu
         if: startsWith(matrix.os_version, 'ubuntu')
         run: |
-          sudo apt update
-          sudo apt install cmake
+          sudo apt-get update
+          sudo apt-get install cmake
       - name: Checkout code
         uses: actions/checkout@v2
       - name: Build Artifacts
