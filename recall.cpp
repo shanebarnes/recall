@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 
 #ifdef __cplusplus
     extern "C" {
@@ -23,6 +24,10 @@
         static void  (*real_free)(void*) = NULL;
         static void* (*real_malloc)(size_t) = NULL;
         static void* (*real_realloc)(void*, size_t) = NULL;
+
+        static int   (*real_madvise)(void*, size_t, int) = NULL;
+        static void* (*real_mmap)(void*, size_t, int, int, int, off_t) = NULL;
+        static int   (*real_munmap)(void*, size_t) = NULL;
 #ifdef __cplusplus
     }
 #endif
@@ -50,6 +55,8 @@
             cryptofree,
             internalnew,
             internaldelete,
+            mmap,
+            munmap,
             max
         };
         const char* _opText[recall::max] = {
@@ -64,7 +71,9 @@
             "crypto.zalloc",
             "crypto.free",
             "internal.new",
-            "internal.delete"
+            "internal.delete",
+            "sys.mmap",
+            "sys.munmap"
         };
 
         class MemMap {
@@ -301,6 +310,7 @@
                 _ignoreOp[recall::cryptomalloc].store(ignore);
                 _ignoreOp[recall::cryptorealloc].store(ignore);
                 _ignoreOp[recall::cryptozalloc].store(ignore);
+                _ignoreOp[recall::mmap].store(ignore);
             }
 
             void ignoreFreeOps(bool ignore) {
@@ -309,6 +319,7 @@
                 _ignoreOp[recall::cryptofree].store(ignore);
                 _ignoreOp[recall::cppdelete].store(ignore);
                 _ignoreOp[recall::cryptofree].store(ignore);
+                _ignoreOp[recall::munmap].store(ignore);
             }
 
 
@@ -331,18 +342,18 @@
                 : std::allocator<T> {
                 typedef typename std::allocator<T>::pointer pointer;
                 typedef typename std::allocator<T>::size_type size_type;
-    
+
                 template<typename U>
                 struct rebind {
                     typedef map_alloc<U> other;
                 };
-    
+
                 map_alloc() {}
-    
+
                 template<typename U>
                 map_alloc(map_alloc<U> const& u)
                     : std::allocator<T>(u) {}
-    
+
                 pointer allocate(size_type size, std::allocator<void>::const_pointer = 0) {
                     auto msize = size * sizeof(T);
                     void *ptr = NULL;
@@ -358,7 +369,7 @@
                     recall::MemMap::getInstance().internalAllocate(size);
                     return static_cast<pointer>(ptr);
                 }
-    
+
                 void deallocate(pointer p, size_type size) {
                         if (p != nullptr) {
                             recall::MemMap::getInstance().internalDeallocate(size);
@@ -493,6 +504,9 @@
                 case recall::internalnew:
                     use = _stats[op].sum - _stats[recall::internaldelete].sum;
                     break;
+                case recall::mmap:
+                    use = _stats[op].sum - _stats[recall::munmap].sum;
+                    break;
                 default:
                     break;
                 }
@@ -526,7 +540,9 @@
                       _stats[recall::cppnew].sum -
                       _stats[recall::cppdelete].sum +
                       _stats[recall::internalnew].sum -
-                      _stats[recall::internaldelete].sum;
+                      _stats[recall::internaldelete].sum +
+                      _stats[recall::mmap].sum -
+                      _stats[recall::munmap].sum;
                 ops = _stats[recall::ccalloc].ops +
                       _stats[recall::cmalloc].ops +
                       _stats[recall::crealloc].ops -
@@ -538,7 +554,9 @@
                       _stats[recall::cppnew].ops -
                       _stats[recall::cppdelete].ops +
                       _stats[recall::internalnew].ops -
-                      _stats[recall::internaldelete].ops;
+                      _stats[recall::internaldelete].ops +
+                      _stats[recall::mmap].ops -
+                      _stats[recall::munmap].ops;
                 fprintf(_statsFile, STATS_RECORD, "net total", use, use, 0LL, 0LL, 0LL, ops);
             }
 
@@ -601,6 +619,15 @@
             real_free = (void (*)(void*))dlsym(RTLD_NEXT, "free");
             fprintf(stdout, "Recall init: loaded free, %p\n", real_free);
 
+            real_madvise = (int (*)(void*, size_t, int))dlsym(RTLD_NEXT, "madvise");
+            fprintf(stdout, "Recall init: loaded madvise, %p\n", real_madvise);
+
+            real_mmap = (void* (*)(void*, size_t, int, int, int, off_t))dlsym(RTLD_NEXT, "mmap");
+            fprintf(stdout, "Recall init: loaded mmap, %p\n", real_mmap);
+
+            real_munmap = (int (*)(void*, size_t))dlsym(RTLD_NEXT, "munmap");
+            fprintf(stdout, "Recall init: loaded munmap, %p\n", real_munmap);
+
             real_CRYPTO_free = (void (*)(void*, const char*, int))dlsym(RTLD_NEXT, "CRYPTO_free");
             fprintf(stdout, "Recall init: loaded CRYPTO_free, %p\n", real_CRYPTO_free);
 
@@ -642,6 +669,54 @@
             void *rptr = init_malloc(size);
             memmove(rptr, ptr, size);
             return rptr;
+        }
+
+
+        int madvise(void *addr, size_t len, int advice) {
+#if defined(__APPLE__)
+            if ((advice & MADV_NORMAL) ||
+                (advice & MADV_RANDOM) ||
+                (advice & MADV_SEQUENTIAL) ||
+                (advice & MADV_WILLNEED) ||
+                (advice & MADV_CAN_REUSE)) {
+#elif defined(__linux__)
+            if ((advice == MADV_NORMAL) ||
+                (advice == MADV_RANDOM) ||
+                (advice == MADV_SEQUENTIAL) ||
+                (advice == MADV_WILLNEED)) {
+#endif
+                recall::MemMap::getInstance().allocate(addr, len, recall::mmap);
+#if defined(__APPLE__)
+            } else if ((advice & MADV_DONTNEED) ||
+                       (advice & MADV_FREE) ||
+                       (advice & MADV_FREE_REUSABLE)) {
+#elif defined(__linux__)
+            } else if ((advice == MADV_DONTNEED) ||
+                       (advice == MADV_REMOVE)) {
+#endif
+                fprintf(stderr, "TODO: madvise free %08x\n", advice);
+            } else {
+                fprintf(stderr, "TODO: madvise unknown %08x\n", advice);
+            }
+            return real_madvise(addr, len, advice);
+        }
+
+        void* mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
+            void *ptr = NULL;
+            //if (real_mmap == NULL) {
+            //    return init_malloc(len);
+            //}
+            ptr = real_mmap(addr, len, prot, flags, fd, offset);
+            //recall::MemMap::getInstance().allocate(ptr, len, recall::mmap);
+            return ptr;
+        }
+
+	    int munmap(void *addr, size_t len) {
+            //if (real_munmap == NULL || init_free(addr) == 0) {
+            //    return len;
+            //}
+            recall::MemMap::getInstance().deallocate(addr, recall::munmap);
+            return real_munmap(addr, len);
         }
 
         void CRYPTO_free(void *ptr, const char *file, int line) {

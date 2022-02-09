@@ -1,5 +1,5 @@
 cmake_minimum_required (VERSION 3.0)
-project(recall VERSION 0.0.1)
+project(recall VERSION 0.0.2)
 
 add_library(${PROJECT_NAME} SHARED recall.cpp)
 add_executable("leak" leak.cpp)
