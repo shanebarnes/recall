@@ -774,7 +774,7 @@
         recallDelete(ptr);
     }
 
-    void* operator new(std::size_t size) throw(std::bad_alloc) {
+    void* operator new(std::size_t size) /*throw(std::bad_alloc)*/ {
         void *ptr = recallNew(size);
         if(ptr == nullptr) {
             throw std::bad_alloc();
@@ -782,7 +782,7 @@
         return ptr;
     }
 
-    void* operator new[](std::size_t size) throw(std::bad_alloc) {
+    void* operator new[](std::size_t size) /*throw(std::bad_alloc)*/ {
         void *ptr = recallNew(size);
         if(ptr == nullptr) {
             throw std::bad_alloc();
