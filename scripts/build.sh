@@ -2,6 +2,7 @@
 
 set -eu
 
-cmake -H. -Bbuild
-cd build
+build_dir="build-$(uname -s)"
+cmake -H. -B"$build_dir"
+cd "$build_dir"
 make

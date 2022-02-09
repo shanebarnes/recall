@@ -14,11 +14,6 @@ jobs:
             script_name: ./scripts/build.sh
     runs-on: ${{ matrix.os_version }}
     steps:
-      - name: Install dependencies on Ubuntu
-        if: startsWith(matrix.os_version, 'ubuntu')
-        run: |
-          #sudo apt-get update
-          #sudo apt-get install cmake
       - name: Checkout code
         uses: actions/checkout@v2
       - name: Build Artifacts
@@ -27,4 +22,4 @@ jobs:
         uses: actions/upload-artifact@master
         with:
           name: recall
-          path: build
+          path: build*
